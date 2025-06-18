@@ -1,3 +1,5 @@
+![image](https://github.com/user-attachments/assets/df6ab3b4-184f-4e64-8a74-2425de45bf69)
+
 # copy-community-chat-review-system
 
 ## 프로젝트 개요
