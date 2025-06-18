@@ -1,13 +1,27 @@
 package com.sleekydz86.config
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
+import com.fasterxml.jackson.datatype.jsr310.ser.LocalDateTimeSerializer
 import org.springframework.context.annotation.Bean
-import org.springframework.context.annotation.Configuration // 또는 다른 적절한 패키지
+import org.springframework.context.annotation.Configuration
+import org.springframework.context.annotation.Primary
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
-@Configuration // 이 클래스가 Spring 설정 클래스임을 명시
+@Configuration
 class JacksonConfig {
-    @Bean // 이 메서드가 반환하는 객체를 Spring 빈으로 등록
+
+    @Bean
+    @Primary
     fun objectMapper(): ObjectMapper {
-        return ObjectMapper()
+        val mapper = ObjectMapper()
+        val module = JavaTimeModule()
+        module.addSerializer(
+            LocalDateTime::class.java,
+            LocalDateTimeSerializer(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+        )
+        mapper.registerModule(module)
+        return mapper
     }
 }

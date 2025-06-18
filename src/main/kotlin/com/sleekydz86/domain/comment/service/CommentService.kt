@@ -33,19 +33,27 @@ class CommentService {
         val comment = Comment().apply {
             this.content = content
             this.userId = userId
-            // likes, version, createdAt, updatedAt는 기본값 또는 @PrePersist로 처리됨
+
         }
         return commentRepository.save(comment)
     }
 
     @Transactional
     fun likeComment(commentId: Long): Comment {
-        // 낙관적 락을 사용하여 좋아요 처리
         val comment = commentRepository.findById(commentId)
             .orElseThrow { EntityNotFoundException("댓글이 존재하지 않음: $commentId") }
         comment.likes = comment.likes + 1
-        // save는 @Version이 있을 경우 버전 번호를 자동으로 체크하며, 충돌 시 예외 발생
-        return commentRepository.save(comment)
+        val updatedComment = commentRepository.save(comment)
+
+        try {
+            redisTemplate.opsForZSet().add(KEY_HOT_COMMENTS, updatedComment.id.toString(), updatedComment.likes.toDouble())
+            redisTemplate.opsForValue().set("$KEY_COMMENT_CACHE_PREFIX${updatedComment.id}", objectMapper.writeValueAsString(updatedComment))
+            log.info("Redis에 댓글 ID: {} 좋아요 수: {} 업데이트 성공", updatedComment.id, updatedComment.likes)
+        } catch (e: Exception) {
+            log.error("Redis 인기 댓글/캐시 업데이트 실패: {}", e.message, e)
+        }
+
+        return updatedComment
     }
 
     fun getTop10HotComments(): List<Comment> {

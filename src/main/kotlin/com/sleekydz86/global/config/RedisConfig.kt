@@ -1,5 +1,6 @@
 package com.sleekydz86.global.config
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.data.redis.connection.RedisConnectionFactory
@@ -11,17 +12,23 @@ import org.springframework.data.redis.serializer.StringRedisSerializer
 class RedisConfig {
 
     @Bean
-    fun redisTemplate(connectionFactory: RedisConnectionFactory): RedisTemplate<String, Any> {
+    fun redisTemplate(
+        connectionFactory: RedisConnectionFactory,
+        objectMapper: ObjectMapper // ObjectMapper 주입
+    ): RedisTemplate<String, Any> {
         return RedisTemplate<String, Any>().apply {
             setConnectionFactory(connectionFactory)
 
-            // 키의 직렬화 방식 설정
+            // Jackson 직렬화기 설정
+            val serializer = GenericJackson2JsonRedisSerializer(objectMapper)
+
+            // 키 직렬화
             keySerializer = StringRedisSerializer()
             hashKeySerializer = StringRedisSerializer()
 
-            // 값의 직렬화 방식 설정
-            valueSerializer = GenericJackson2JsonRedisSerializer()
-            hashValueSerializer = GenericJackson2JsonRedisSerializer()
+            // 값 직렬화
+            valueSerializer = serializer
+            hashValueSerializer = serializer
 
             afterPropertiesSet()
         }
