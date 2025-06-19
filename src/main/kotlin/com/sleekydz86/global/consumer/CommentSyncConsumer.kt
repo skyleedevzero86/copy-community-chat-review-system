@@ -18,97 +18,112 @@ class CommentSyncConsumer {
 
     companion object {
         private val log = LoggerFactory.getLogger(CommentSyncConsumer::class.java)
-
-        private const val KEY_HOT_COMMENTS = "hot_comments" // 인기 댓글 키
-        private const val KEY_COMMENT_CACHE_PREFIX = "comment:" // 댓글 캐시 키 접두사
-
-        // TiDB 시간 형식 파서 (yyyy-MM-dd HH:mm:ss)
+        private const val KEY_HOT_COMMENTS = "hot_comments"
+        private const val KEY_COMMENT_CACHE_PREFIX = "comment:"
         private val TIDB_DATETIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     }
 
     @Autowired
-    private lateinit var objectMapper: ObjectMapper // JSON 매핑 객체
+    private lateinit var objectMapper: ObjectMapper
 
     @Autowired
-    private lateinit var redisTemplate: RedisTemplate<String, Any> // Redis 템플릿
+    private lateinit var redisTemplate: RedisTemplate<String, Any>
 
     @KafkaListener(topics = ["comment-topic"], groupId = "comment-sync-group-final")
     fun listen(messageBytes: ByteArray?) {
-        // 메시지가 없거나 빈 경우 (하트비트 메시지) 무시
         if (messageBytes == null || messageBytes.isEmpty()) {
             return
         }
 
         val originalMessage = String(messageBytes, StandardCharsets.UTF_8)
         var jsonPayload = ""
+
         try {
-            // JSON 객체 시작 위치 찾기
             val jsonStart = originalMessage.indexOf('{')
             if (jsonStart == -1) {
-                log.warn("수신된 메시지에 유효한 JSON 객체가 포함되지 않음. 메시지: {}", originalMessage)
+                log.warn("유효하지 않은 JSON 메시지: {}", originalMessage)
                 return
             }
             jsonPayload = originalMessage.substring(jsonStart)
 
-            log.info("정리된 유효 JSON 메시지: {}", jsonPayload)
+            log.info("처리할 JSON 메시지: {}", jsonPayload)
             val rootNode: JsonNode = objectMapper.readTree(jsonPayload)
 
             val (eventType, dataNode) = when {
                 rootNode.has("u") -> "UPSERT" to rootNode.get("u")
                 rootNode.has("d") -> "DELETE" to rootNode.get("d")
                 else -> {
-                    log.warn("알 수 없는 JSON 형식 (u 또는 d 없음). 메시지: {}", jsonPayload)
+                    log.warn("알 수 없는 이벤트 타입: {}", jsonPayload)
                     return
                 }
             }
 
-            val comment = Comment().apply {
-                // JSON의 'v' 값 추출
-                id = dataNode.get("id").get("v").asLong()
-                content = dataNode.get("content").get("v").asText()
+            val comment = parseComment(dataNode)
+            log.info("파싱된 Comment: ID={}, Content={}, Likes={}", comment.id, comment.content, comment.likes)
 
-                // JSON의 user_id를 엔티티의 userId로 매핑
-                userId = dataNode.get("user_id").get("v").asText()
-
-                likes = dataNode.get("likes").get("v").asInt()
-                version = dataNode.get("version").get("v").asInt()
-
-                // 문자열을 LocalDateTime으로 변환
-                val createdAtStr = dataNode.get("created_at").get("v").asText()
-                val updatedAtStr = dataNode.get("updated_at").get("v").asText()
-
-                createdAt = LocalDateTime.parse(createdAtStr, TIDB_DATETIME_FORMATTER)
-                updatedAt = LocalDateTime.parse(updatedAtStr, TIDB_DATETIME_FORMATTER)
-            }
-
-            log.info("성공적으로 파싱된 Comment 객체: {}", comment)
-
-            // 이벤트 타입에 따른 비즈니스 로직
+            // Redis 업데이트
             when (eventType) {
-                "UPSERT" -> {
-                    comment.id?.let { commentId ->
-                        redisTemplate.opsForZSet().add(KEY_HOT_COMMENTS, commentId.toString(), comment.likes.toDouble())
-                        log.info("Redis 인기 댓글 목록 업데이트: Comment ID = {}, Likes = {}", commentId, comment.likes)
-
-                        val cacheKey = "$KEY_COMMENT_CACHE_PREFIX$commentId"
-                        val commentJson = objectMapper.writeValueAsString(comment)
-                        redisTemplate.opsForValue().set(cacheKey, commentJson, 1, TimeUnit.HOURS)
-                        log.info("Redis 캐시 업데이트: Key = {}", cacheKey)
-                    }
-                }
-                "DELETE" -> {
-                    comment.id?.let { commentId ->
-                        redisTemplate.opsForZSet().remove(KEY_HOT_COMMENTS, commentId.toString())
-                        log.info("Redis 인기 댓글 목록에서 제거: Comment ID = {}", commentId)
-
-                        redisTemplate.delete("$KEY_COMMENT_CACHE_PREFIX$commentId")
-                        log.info("Redis 캐시에서 삭제: Key = {}", "$KEY_COMMENT_CACHE_PREFIX$commentId")
-                    }
-                }
+                "UPSERT" -> handleUpsertEvent(comment)
+                "DELETE" -> handleDeleteEvent(comment)
             }
 
         } catch (e: Exception) {
-            log.error("Kafka 메시지 처리 중 알 수 없는 오류 발생! 원본 메시지: [{}], 처리 시도한 JSON: [{}]", originalMessage, jsonPayload, e)
+            log.error("Kafka 메시지 처리 실패 - 원본: [{}], JSON: [{}]", originalMessage, jsonPayload, e)
+        }
+    }
+
+    private fun parseComment(dataNode: JsonNode): Comment {
+        return Comment().apply {
+            id = dataNode.get("id").get("v").asLong()
+            content = dataNode.get("content").get("v").asText()
+            userId = dataNode.get("user_id").get("v").asText()
+            likes = dataNode.get("likes").get("v").asInt()
+            version = dataNode.get("version").get("v").asInt()
+
+            val createdAtStr = dataNode.get("created_at").get("v").asText()
+            val updatedAtStr = dataNode.get("updated_at").get("v").asText()
+
+            createdAt = LocalDateTime.parse(createdAtStr, TIDB_DATETIME_FORMATTER)
+            updatedAt = LocalDateTime.parse(updatedAtStr, TIDB_DATETIME_FORMATTER)
+        }
+    }
+
+    private fun handleUpsertEvent(comment: Comment) {
+        try {
+            comment.id?.let { commentId ->
+                // Sorted Set 업데이트 (좋아요 수를 점수로 사용)
+                redisTemplate.opsForZSet().add(
+                    KEY_HOT_COMMENTS,
+                    commentId.toString(),
+                    comment.likes.toDouble()
+                )
+
+                // 개별 댓글 캐시 업데이트
+                val cacheKey = "$KEY_COMMENT_CACHE_PREFIX$commentId"
+                val commentJson = objectMapper.writeValueAsString(comment)
+                redisTemplate.opsForValue().set(cacheKey, commentJson, 1, TimeUnit.HOURS)
+
+                log.info("Redis UPSERT 완료 - ID: {}, Likes: {}", commentId, comment.likes)
+            }
+        } catch (e: Exception) {
+            log.error("Redis UPSERT 실패 - Comment ID: {}", comment.id, e)
+        }
+    }
+
+    private fun handleDeleteEvent(comment: Comment) {
+        try {
+            comment.id?.let { commentId ->
+                // Sorted Set에서 제거
+                redisTemplate.opsForZSet().remove(KEY_HOT_COMMENTS, commentId.toString())
+
+                // 개별 캐시 삭제
+                val cacheKey = "$KEY_COMMENT_CACHE_PREFIX$commentId"
+                redisTemplate.delete(cacheKey)
+
+                log.info("Redis DELETE 완료 - ID: {}", commentId)
+            }
+        } catch (e: Exception) {
+            log.error("Redis DELETE 실패 - Comment ID: {}", comment.id, e)
         }
     }
 }
